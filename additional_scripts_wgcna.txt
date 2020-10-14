@@ -1,0 +1,178 @@
+Date: 04.30.2018
+library(limma)
+library(edgeR)
+library(WGCNA)
+library(flashClust)
+library(DESeq2)
+library(variancePartition)
+
+exprs <- as.matrix(read.csv("raw_counts.csv", header=TRUE, sep=",", row.names=1,as.is=TRUE))
+cova = read.csv ("joe_YW_pheno.csv", header=T)
+dds <- DESeqDataSetFromMatrix(countData = exprs, cova, design = ~ 1)
+dds <- estimateSizeFactors(dds)
+isexpr <- rowSums(cpm(exprs)>1) >= 0.5 * ncol(exprs)
+gExpr <- DGEList(counts=exprs[isexpr,])
+gExpr <- calcNormFactors(gExpr)
+
+#batch effect removal
+design <- model.matrix( ~ Sex + cage + Harvest , cova)
+batch.design <- design[,-(1:2)]
+vobjGenes <- voom(gExpr, design )
+vsd.removed=removeBatchEffect(vobjGenes, batch=cova$Batch, covariates=batch.design)
+vsd.removed.t <- t(vsd.removed)
+datExpr<- vsd.removed.t
+
+row.names(datExpr) = colnames(exprs)
+row.names(cova1) <- rownames(datExpr)
+table(rownames(cova1)==rownames(datExpr))
+
+#Clustering of samples
+library("amap")
+pdf("Sample.clustering.hcluster.of.Batch.pdf")
+plot(hcluster(dist(t(vsd.removed)), method= "spearman", link="average" ), cex=1.5, cex.main=2, main= "Hierarchical Clustering of VSD Normalized Count Data ")
+dev.off()
+
+#Choose a soft threshold power
+powers = c(c(1:10), seq(from =10, to=30, by=1)) #choosing a set of soft-thresholding powers
+sft = pickSoftThreshold(datExpr, powerVector=powers, verbose =5, networkType="signed") #call network topology analysis function
+
+#Plot scale independence
+pdf("power.scale.independence.plots.pdf")
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2], xlab= "Soft Threshold (power)", ylab="Scale Free Topology Model Fit, signed R^2", type= "n", main= paste("Scale independence"))
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2], labels=powers, col="red")
+abline(h=0.90, col="red")
+
+softPower = 13
+adjacency = adjacency(datExpr, power = softPower, type = "signed")
+TOM = TOMsimilarity(adjacency, TOMType="signed")
+dissTOM = 1-TOM
+geneTree = flashClust(as.dist(dissTOM), method="average")
+pdf("gene.tree.plots.1.pdf")
+plot(geneTree, xlab="", sub="", main= "Gene Clustering on TOM-based dissimilarity", labels= FALSE, hang=0.04)
+dev.off()
+
+#This sets the minimum number of genes to cluster into a module
+minModuleSize = 30 
+dynamicMods = cutreeDynamic(dendro= geneTree, distM= dissTOM, deepSplit=2, pamRespectsDendro= FALSE, minClusterSize = minModuleSize)
+
+dynamicColors= labels2colors(dynamicMods)
+MEList= moduleEigengenes(datExpr, colors= dynamicColors,softPower = 13)
+MEs= MEList$eigengenes
+MEDiss= 1-cor(MEs)
+METree= flashClust(as.dist(MEDiss), method= "average")
+
+#Plot eignegenes plots of modules
+
+
+pdf("MEtree.plots.1.pdf")
+plot(METree, main= "Clustering of module eigengenes", xlab= "", sub= "")
+MEDissThres = 0.25
+abline(h=MEDissThres, col = "red")
+dev.off()
+
+#Merge realted modules
+#We choose a height cut of 0.25, corresponding to correlation of 0.75, to merge
+merge = mergeCloseModules(datExpr, dynamicColors, cutHeight = MEDissThres, verbose = 3)
+mergedColors = merge$colors
+mergedMEs = merge$newMEs
+pdf(file = "geneDendro-3.with.colors.pdf", wi = 9, he = 6)
+plotDendroAndColors(geneTree, cbind(dynamicColors, mergedColors),
+c("Dynamic Tree Cut", "Merged dynamic"),
+dendroLabels = FALSE, hang = 0.03,
+addGuide = TRUE, guideHang = 0.05)
+dev.off()
+
+# Rename to moduleColors
+moduleColors = mergedColors
+# Construct numerical labels corresponding to the colors
+colorOrder = c("grey", standardColors(50));
+moduleLabels = match(moduleColors, colorOrder)-1;
+MEs = mergedMEs;
+
+###Correlate traits
+#Define number of genes and samples
+nGenes = ncol(datExpr)
+nSamples = nrow(datExpr)
+
+#Recalculate MEs with color labels
+MEs0 = moduleEigengenes(datExpr, moduleColors)$eigengenes
+MEs = orderMEs(MEs0)
+cova1 = read.csv ("joe_cova_wgcna_YW.csv", header=T)
+row.names(cova1) <- rownames(datExpr)
+table(rownames(cova1)==rownames(datExpr))
+moduleTraitCor = cor(MEs, cova1, use= "p")
+moduleTraitPvalue = corPvalueStudent(moduleTraitCor, nSamples)
+
+#Print correlation heatmap between modules and traits
+textMatrix= paste(signif(moduleTraitCor, 2), "\n(", 
+                    signif(moduleTraitPvalue, 1), ")", sep= "")
+dim(textMatrix)= dim(moduleTraitCor)
+par(mar= c(2, 6, 2, 2))
+#display the corelation values with a heatmap plot
+pdf(file = "trait.module.corr.pdf", wi = 8.5, he = 8)
+par(mar= c(6, 8.5, 3, 3))
+labeledHeatmap(Matrix= moduleTraitCor, 
+            xLabels= names(cova1), 
+            yLabels= names(MEs), 
+            ySymbols= names(MEs), 
+            colorLabels= FALSE, 
+            colors= blueWhiteRed(50), 
+            textMatrix= textMatrix, 
+            setStdMargins= FALSE, 
+            cex.text= 0.5, 
+            zlim= c(-1,1), 
+            main= paste("Module-trait relationships"))
+            dev.off()
+            
+genes.magenta = genes[ mergedColors=="magenta"]
+#restrictGenes=moduleColors=="darkmagenta"
+
+save.image (joe_yw.RData)   
+
+#### Differential expression
+ddsMat<- DESeqDataSetFromMatrix(gExpr, cova, design=~Batch+Sex+Harvest+Genotype)
+cova$Genotype <- relevel(cova$Genotype, "WT")
+dds<-DESeq(ddsMat)
+res = results(dds)
+write.table (res, "joe_yw_diff_exp.txt", quote=F)
+genes.magenta = genes[ mergedColors=="magenta"]
+res[which(rownames(res) %in% genes.magenta),]
+genes.magent.p = res[which(rownames(res) %in% genes.magenta),]
+genes.mediumpurple3 = genes[ mergedColors=="mediumpurple3"]
+genes.mediumpurple3.p = res[which(rownames(res) %in% genes.mediumpurple3),]
+genes.magent.p$fdr <- p.adjust(genes.magent.p$pvalue, method = "fdr", n = length(genes.magent.p$pvalue))
+genes.mediumpurple3.p$fdr <- p.adjust(genes.mediumpurple3.p$pvalue, method = "fdr", n = length(genes.mediumpurple3.p$pvalue))
+write.table (genes.mediumpurple3.p, "genes_mediumpurple3_p.txt", quote =F)
+
+
+##########################################################################################
+> dim(gExpr$counts)
+[1] 14363    30
+> dim(exprs)
+[1] 49315    30
+
+## Variance componenet
+gExpr.counts = getCounts(gExpr)
+form = ~( Groupings+Batch+Sex+age+Harvest+cage+breeding)
+varPartResid.ind <- fitExtractVarPartModel( gExpr.counts, form, cova )
+pdf('vp.test.pdf')
+plotVarPart(varPartResid.ind,main="Variance Partioning on raw counts")
+dev.off()
+## varaince componenet after removing covariates
+design <- model.matrix( ~ Batch+Sex+age+Harvest+cage+breeding, cova)
+vobjGenes <- voom(gExpr.counts, design )
+fit <- lmFit( vobjGenes, model.matrix(~ Batch+Harvest+cage, cova))
+res <- residuals( fit, vobjGenes)
+form = ~( Groupings)
+varPartResid.ind <- fitExtractVarPartModel( res, form, cova )
+pdf('vp.test.corrected.pdf')
+plotVarPart(varPartResid.ind,main="Variance Partioning after correction ")
+dev.off()
+
+
+cova_c_a = cova[(cova$Groupings=="C" | cova$Groupings=="A"),]
+map = match( cova_c_a$ID,colnames(exprs) )
+exprs_c_a = exprs[,map]
+
+
+
